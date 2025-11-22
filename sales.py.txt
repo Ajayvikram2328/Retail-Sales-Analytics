@@ -1,0 +1,310 @@
+import os
+import random
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Configuration
+# -------------------------
+DATAFILE = "retail_sales.csv"
+OUTDIR = "outputs"
+SYNTH_ROWS_APPROX = 8000  # approx transactions to generate if dataset missing
+
+# Ensure output dir
+os.makedirs(OUTDIR, exist_ok=True)
+
+# -------------------------
+# Synthetic dataset generator (if no file provided)
+# -------------------------
+def generate_synthetic_dataset(csv_path=DATAFILE, approx_rows=SYNTH_ROWS_APPROX,
+                               start_date="2023-01-01", days=730, stores=6, products=30):
+    random.seed(42)
+    np.random.seed(42)
+    start = datetime.fromisoformat(start_date)
+    product_list = [f"Product_{i+1}" for i in range(products)]
+    categories = ["Electronics", "Clothing", "Home", "Grocery", "Sports", "Beauty"]
+    stores_list = [f"Store_{i+1}" for i in range(stores)]
+    payment_methods = ["Card", "UPI", "Cash", "Wallet"]
+
+    rows = []
+    # We'll generate transactions per store per day with random counts until approx_rows reached
+    while len(rows) < approx_rows:
+        store = random.choice(stores_list)
+        date_offset = random.randint(0, days-1)
+        date = (start + timedelta(days=date_offset)).date()
+        num_tx = random.randint(1, 8)
+        for _ in range(num_tx):
+            product = random.choice(product_list)
+            category = random.choice(categories)
+            base_price = round(random.uniform(50, 3000), 2)
+            # category adjustments
+            if category == "Electronics":
+                price = round(base_price * random.uniform(1.2, 1.8), 2)
+            elif category == "Grocery":
+                price = round(base_price * random.uniform(0.2, 0.6), 2)
+            else:
+                price = base_price
+            qty = int(np.clip(np.random.poisson(1.5), 1, 10))
+            amount = round(price * qty * random.uniform(0.7, 1.3), 2)
+            customer_age = int(np.clip(np.random.normal(35, 12), 16, 80))
+            payment = random.choices(payment_methods, weights=[0.45,0.3,0.2,0.05])[0]
+            rows.append({
+                "Date": date.isoformat(),
+                "Product": product,
+                "Category": category,
+                "Quantity": qty,
+                "Amount": amount,
+                "Store": store,
+                "Payment_Method": payment,
+                "Customer_Age": customer_age
+            })
+            if len(rows) >= approx_rows:
+                break
+
+    df = pd.DataFrame(rows)
+    # Shuffle
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    df.to_csv(csv_path, index=False)
+    print(f"[INFO] Synthetic dataset generated and saved to {csv_path} ({len(df)} rows).")
+    return df
+
+# -------------------------
+# Load dataset (or generate)
+# -------------------------
+if os.path.exists(DATAFILE):
+    print(f"[INFO] Loading dataset from {DATAFILE}")
+    df = pd.read_csv(DATAFILE)
+else:
+    print(f"[INFO] {DATAFILE} not found — generating synthetic dataset.")
+    df = generate_synthetic_dataset()
+
+# -------------------------
+# Standardize column names (safe handling)
+# -------------------------
+df_columns = {c: c.strip() for c in df.columns}
+df.rename(columns=df_columns, inplace=True)
+
+# Map common variations to expected names
+col_map = {}
+col_map_candidates = {
+    "date": ["date", "Date", "transaction_date", "txn_date"],
+    "product": ["product", "Product", "item", "Item"],
+    "category": ["category", "Category"],
+    "quantity": ["quantity", "Quantity", "qty", "Qty"],
+    "amount": ["amount", "Amount", "sale_amount", "Sale_Amount", "Total"],
+    "store": ["store", "Store", "location", "Location"],
+    "payment_method": ["payment_method", "Payment_Method", "payment", "Payment"],
+    "customer_age": ["customer_age", "Customer_Age", "age", "Age"]
+}
+for standard, variants in col_map_candidates.items():
+    for v in variants:
+        if v in df.columns:
+            col_map[v] = standard.capitalize() if standard!="amount" else "Amount"
+            break
+
+# Apply renaming where we can
+rename_map = {}
+for existing, mapped in col_map.items():
+    if existing in df.columns:
+        rename_map[existing] = mapped
+df.rename(columns=rename_map, inplace=True)
+
+# Required columns we want to work with (after rename)
+expected_cols = ["Date","Product","Category","Quantity","Amount","Store","Payment_Method","Customer_Age"]
+# Add missing columns with defaults
+for c in expected_cols:
+    if c not in df.columns:
+        # sensible defaults
+        if c == "Date":
+            df["Date"] = pd.to_datetime(datetime.today().date())
+        elif c == "Quantity":
+            df["Quantity"] = 1
+        elif c == "Amount":
+            df["Amount"] = 0.0
+        elif c == "Customer_Age":
+            df["Customer_Age"] = int(np.clip(np.random.normal(35,12),16,80))
+        elif c == "Payment_Method":
+            df["Payment_Method"] = "Card"
+        elif c == "Store":
+            df["Store"] = "Store_1"
+        elif c == "Product":
+            df["Product"] = "Unknown"
+        elif c == "Category":
+            df["Category"] = "Misc"
+
+# -------------------------
+# Basic cleaning & typing
+# -------------------------
+# Parse dates
+df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+# Drop rows with invalid dates
+df = df.dropna(subset=['Date']).copy()
+# Numeric conversions
+df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
+df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(1).astype(int)
+df['Customer_Age'] = pd.to_numeric(df['Customer_Age'], errors='coerce').fillna(35).astype(int)
+
+# Remove negative or zero amounts (if any)
+df = df[df['Amount'] > 0].reset_index(drop=True)
+
+print(f"[INFO] Cleaned dataset rows: {len(df)}")
+print(df.head(3).to_string(index=False))
+
+# -------------------------
+# Aggregations / EDA
+# -------------------------
+# 1) Daily sales
+daily = df.groupby('Date', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    transactions = ('Amount','count'),
+    avg_sale = ('Amount','mean')
+).sort_values('Date')
+
+daily.to_csv(os.path.join(OUTDIR,"daily_sales.csv"), index=False)
+
+# 2) Monthly sales
+df['Month'] = df['Date'].dt.to_period('M')
+monthly = df.groupby('Month', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    transactions = ('Amount','count')
+)
+monthly['Month'] = monthly['Month'].dt.to_timestamp()
+monthly.to_csv(os.path.join(OUTDIR,"monthly_sales.csv"), index=False)
+
+# 3) Category-wise sales
+category_sales = df.groupby('Category', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    transactions = ('Amount','count')
+).sort_values('total_sales', ascending=False)
+category_sales.to_csv(os.path.join(OUTDIR,"category_sales.csv"), index=False)
+
+# 4) Top products
+top_products = df.groupby('Product', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    quantity_sold = ('Quantity','sum')
+).sort_values('total_sales', ascending=False).head(20)
+top_products.to_csv(os.path.join(OUTDIR,"top_products.csv"), index=False)
+
+# 5) Payment method share
+payment_share = df.groupby('Payment_Method', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    transactions = ('Amount','count')
+).sort_values('total_sales', ascending=False)
+payment_share.to_csv(os.path.join(OUTDIR,"payment_share.csv"), index=False)
+
+# 6) Age group summary
+def age_group_bucket(age):
+    if age < 20: return "<20"
+    if age < 30: return "20-29"
+    if age < 40: return "30-39"
+    if age < 50: return "40-49"
+    return "50+"
+
+df['Age_Group'] = df['Customer_Age'].apply(age_group_bucket)
+age_group_summary = df.groupby('Age_Group', as_index=False).agg(
+    total_sales = ('Amount','sum'),
+    transactions = ('Amount','count'),
+    avg_sale = ('Amount','mean')
+).sort_values('total_sales', ascending=False)
+age_group_summary.to_csv(os.path.join(OUTDIR,"age_group_summary.csv"), index=False)
+
+# -------------------------
+# Plots (matplotlib)
+# -------------------------
+plt.rcParams.update({'figure.max_open_warning': 0})
+
+# Daily sales line
+plt.figure(figsize=(12,4))
+plt.plot(daily['Date'], daily['total_sales'])
+plt.title("Daily Total Sales")
+plt.xlabel("Date")
+plt.ylabel("Total Sales")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"daily_sales.png"))
+plt.close()
+
+# Monthly sales line
+plt.figure(figsize=(10,4))
+plt.plot(monthly['Month'], monthly['total_sales'], marker='o')
+plt.title("Monthly Total Sales")
+plt.xlabel("Month")
+plt.ylabel("Total Sales")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"monthly_sales.png"))
+plt.close()
+
+# Category bar
+plt.figure(figsize=(9,5))
+plt.bar(category_sales['Category'], category_sales['total_sales'])
+plt.title("Sales by Category")
+plt.xlabel("Category")
+plt.ylabel("Total Sales")
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"category_sales.png"))
+plt.close()
+
+# Top 10 products bar
+top10 = top_products.head(10).iloc[::-1]  # reverse for horizontal bar
+plt.figure(figsize=(10,6))
+plt.barh(top10['Product'], top10['total_sales'])
+plt.title("Top 10 Products by Sales")
+plt.xlabel("Total Sales")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"top_products.png"))
+plt.close()
+
+# Payment method pie
+plt.figure(figsize=(7,7))
+plt.pie(payment_share['total_sales'], labels=payment_share['Payment_Method'], autopct='%1.1f%%', startangle=90)
+plt.title("Payment Method Sales Share")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"payment_pie.png"))
+plt.close()
+
+# Age histogram
+plt.figure(figsize=(8,4))
+plt.hist(df['Customer_Age'].dropna(), bins=[15,20,30,40,50,60,80], edgecolor='black')
+plt.title("Customer Age Distribution")
+plt.xlabel("Age")
+plt.ylabel("Count")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR,"age_histogram.png"))
+plt.close()
+
+# -------------------------
+# Print quick insights
+# -------------------------
+print("\n===== QUICK INSIGHTS =====")
+# Top category
+top_cat = category_sales.iloc[0]
+print(f"- Top category by sales: {top_cat['Category']} (₹{top_cat['total_sales']:.2f})")
+
+# Top product
+top_prod = top_products.iloc[0]
+print(f"- Top product by sales: {top_prod['Product']} (₹{top_prod['total_sales']:.2f})")
+
+# Payment share top method
+top_pay = payment_share.iloc[0]
+print(f"- Preferred payment method by sales: {top_pay['Payment_Method']} ({top_pay['total_sales']:.2f}, {top_pay['transactions']} txns)")
+
+# Peak sales day
+peak = daily.loc[daily['total_sales'].idxmax()]
+print(f"- Peak sales day: {peak['Date'].date()} with total sales ₹{peak['total_sales']:.2f}")
+
+# Age group highest spend
+top_age = age_group_summary.iloc[0]
+print(f"- Highest spending age group: {top_age['Age_Group']} (₹{top_age['total_sales']:.2f})")
+
+# -------------------------
+# Save a small text report
+# -------------------------
+report_lines = [
+    "Retail Sales Data Analytics - Quick Report",
+    f"Generated on: {datetime.now().isoformat()}",
+    f"Dataset rows: {len(df)}",
+    f"Top category: {top_cat['Category']} (₹{top_cat['total_sales']:.2f})",
+    f"Top product: {top_prod['Product']} (₹{top_prod['total_sales']:.2f})",
+    f"Preferred payment: {top_pay['Payment_Metho
